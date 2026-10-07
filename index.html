@@ -1259,6 +1259,24 @@
         </div>
     </div>
 
+    <!-- Incoming Call Alert -->
+    <div id="incomingCallAlert" class="hidden fixed top-4 left-1/2 -translate-x-1/2 w-[92%] max-w-sm glass-card p-4 z-[700] border-2 border-[#ff3e3e]/60">
+        <div class="flex items-center gap-3">
+            <div class="relative">
+                <div class="w-12 h-12 rounded-full bg-[#ff3e3e] flex items-center justify-center"><i class="fas fa-phone text-white"></i></div>
+                <div class="absolute inset-0 rounded-full border-2 border-[#ff3e3e] animate-ping"></div>
+            </div>
+            <div class="flex-1">
+                <p class="font-black text-sm uppercase">Incoming Call</p>
+                <p class="text-[10px] text-[#ff8080] font-bold" id="incomingJobInfo">No job context</p>
+            </div>
+            <div class="flex gap-2">
+                <button onclick="answerCall(true)" class="w-11 h-11 bg-[#00ff88] rounded-xl flex items-center justify-center text-black"><i class="fas fa-phone"></i></button>
+                <button onclick="answerCall(false)" class="w-11 h-11 bg-[#ff3e3e] rounded-xl flex items-center justify-center text-white"><i class="fas fa-times"></i></button>
+            </div>
+        </div>
+    </div>
+
     <!-- MODAL: 24S CONNECT CALL -->
     <div id="callModal" class="modal">
         <div class="modal-card max-w-xl p-0 overflow-hidden" style="background:#020c1b;">
@@ -1273,24 +1291,6 @@
                 <span class="absolute top-3 left-4 text-[9px] font-black uppercase tracking-widest text-white/30">Remote • WebRTC <span id="peerStatus" class="text-[#ff8080]">[offline]</span></span>
                 <div id="selfView" class="hidden absolute bottom-3 right-3 w-24 aspect-video bg-black/70 border border-[#ff3e3e]/40 rounded-lg overflow-hidden">
                     <video id="localVideo" autoplay playsinline muted class="w-full h-full object-cover"></video>
-                </div>
-            </div>
-
-            <!-- Incoming Call Alert -->
-            <div id="incomingCallAlert" class="hidden absolute top-4 left-1/2 -translate-x-1/2 w-[92%] max-w-sm glass-card p-4 z-[650] border-2 border-[#ff3e3e]/60">
-                <div class="flex items-center gap-3">
-                    <div class="relative">
-                        <div class="w-12 h-12 rounded-full bg-[#ff3e3e] flex items-center justify-center"><i class="fas fa-phone text-white"></i></div>
-                        <div class="absolute inset-0 rounded-full border-2 border-[#ff3e3e] animate-ping"></div>
-                    </div>
-                    <div class="flex-1">
-                        <p class="font-black text-sm uppercase">Incoming Call</p>
-                        <p class="text-[10px] text-[#ff8080] font-bold" id="incomingJobInfo">No job context</p>
-                    </div>
-                    <div class="flex gap-2">
-                        <button onclick="answerCall(true)" class="w-11 h-11 bg-[#00ff88] rounded-xl flex items-center justify-center text-black"><i class="fas fa-phone"></i></button>
-                        <button onclick="answerCall(false)" class="w-11 h-11 bg-[#ff3e3e] rounded-xl flex items-center justify-center text-white"><i class="fas fa-times"></i></button>
-                    </div>
                 </div>
             </div>
 
@@ -1509,6 +1509,7 @@
         }
 
         function signOutFirebase() {
+            try { endCall(); destroyPeer(); } catch (e) {}
             fb.unsubscribers.forEach(u => { try { u(); } catch (e) {} });
             fb.unsubscribers = [];
             if (fb.ready && fb.auth) fb.auth.signOut().catch(() => {});
@@ -1694,7 +1695,7 @@
             
             state.activeJobId = state.activeJobId || state.jobs[0]?.id || null;
             switchRole(role);
-            if (state.activeJobId) initRTC();
+            initRTC();
         }
 
         function switchRole(role) {
@@ -2103,283 +2104,358 @@
             return state.jobs.find(j => j.id === state.activeJobId) || state.jobs[0] || null;
         }
 
-        /* ========== REAL WEBRTC ENGINE (PeerJS + getUserMedia) ========== */
-        const rtc = {
-            peer: null,
-            localStream: null,
-            activeConn: null,
-            incomingConn: null,
-            muted: false,
-            videoOff: false,
-            mode: 'voice',
-            currentPeerId: null
+        /* ========== WEBRTC ENGINE (PeerJS + getUserMedia) — optimised ========== */
+        const RTC_CONFIG = {
+            // Optional self-hosted PeerJS server, e.g. { host: 'peer.yourdomain.com', port: 443, path: '/', secure: true }
+            server: {},
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                // TURN relay: required on mobile data / CGNAT / corporate firewalls.
+                // This free public relay is for testing; replace with your own (Metered, Twilio, coturn) for production.
+                { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp'],
+                  username: 'openrelayproject', credential: 'openrelayproject' }
+            ],
+            ringTimeoutMs: 45000,
+            audioBitrate: 32000,
+            // Adaptive video ladder: steps down on packet loss / high RTT, back up when the link recovers
+            levels: [
+                { label: 'HD', bitrate: 600000, scale: 1, video: true },
+                { label: 'Low', bitrate: 180000, scale: 2, video: true },
+                { label: 'Audio only', bitrate: 0, scale: 4, video: false }
+            ]
         };
 
-        // Use Firebase UID as peer ID so both sides always find each other
+        const rtc = {
+            peer: null, localStream: null, activeConn: null, incomingConn: null,
+            muted: false, videoOff: false, mode: 'voice', currentPeerId: null,
+            retry: 0, retryTimer: null, ringTimer: null, ringBuzz: null, ringAuto: null,
+            statsTimer: null, level: 0, bad: 0, good: 0, logged: false, ending: false, wake: null
+        };
+        const $id = id => document.getElementById(id);
+
+        // Firebase UID as peer ID so both sides always find each other
         function getMyPeerId() {
             const uid = fb.ready && fb.auth.currentUser ? fb.auth.currentUser.uid : null;
             if (uid) return '24S-' + uid;
-            // Fallback for local mode: role + random
-            return '24S-LOCAL-' + state.role.toUpperCase() + '-' + Math.random().toString(36).slice(2, 8);
+            return '24S-LOCAL-' + String(state.role).toUpperCase() + '-' + Math.random().toString(36).slice(2, 8);
         }
 
         function setPeerStatus(txt, ok) {
-            const el = document.getElementById('peerStatus');
-            if (el) {
-                el.textContent = '[' + txt + ']';
-                el.style.color = ok ? '#00ff88' : '#ff8080';
-            }
+            const el = $id('peerStatus');
+            if (el) { el.textContent = '[' + txt + ']'; el.style.color = ok ? '#00ff88' : '#ff8080'; }
+        }
+        function setCallStatus(txt, ok) {
+            const el = $id('callStatus');
+            if (el) { el.textContent = txt; el.style.color = ok ? '#00ff88' : '#ff8080'; }
         }
 
         function destroyPeer() {
-            if (rtc.peer) {
-                try { rtc.peer.destroy(); } catch(e) {}
-                rtc.peer = null;
-                rtc.currentPeerId = null;
-            }
+            clearTimeout(rtc.retryTimer);
+            if (rtc.peer) { try { rtc.peer.destroy(); } catch (e) {} }
+            rtc.peer = null; rtc.currentPeerId = null;
         }
 
+        // Exponential backoff re-registration (1s, 2s, 4s … max 30s); never tears down a live call
+        function scheduleRetry() {
+            clearTimeout(rtc.retryTimer);
+            const delay = Math.min(30000, 1000 * 2 ** Math.min(rtc.retry++, 5));
+            rtc.retryTimer = setTimeout(() => {
+                if (rtc.activeConn) return scheduleRetry();
+                destroyPeer(); initRTC();
+            }, delay);
+        }
+
+        // Idempotent: safe to call from login, call start, tab resume, or network change
         function initRTC() {
+            if (!state.role) return;
             const myId = getMyPeerId();
-            // Already registered with same ID
-            if (rtc.peer && rtc.peer.open && rtc.currentPeerId === myId) return;
-            // Different ID or dead peer — recreate
-            destroyPeer();
-
-            setPeerStatus('connecting…', false);
-
-            rtc.peer = new Peer(myId, {
-                debug: 1,
-                config: {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' }
-                    ]
-                }
-            });
-
-            rtc.currentPeerId = myId;
-
-            rtc.peer.on('open', (id) => {
-                setPeerStatus('online', true);
-                console.log('WebRTC peer online:', id);
-            });
-
-            rtc.peer.on('error', e => {
-                console.error('PeerJS error:', e.type, e);
-                if (e.type === 'unavailable-id') {
-                    // ID taken (e.g. duplicate tab) — retry with suffix
-                    destroyPeer();
-                    rtc.peer = new Peer(myId + '-' + Date.now() % 10000, {
-                        debug: 1,
-                        config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-                    });
-                    rtc.peer.on('open', () => setPeerStatus('online (reconnected)', true));
-                    rtc.peer.on('call', handleIncomingCall);
-                } else {
-                    setPeerStatus(e.type, false);
-                }
-            });
-
-            rtc.peer.on('disconnected', () => {
-                setPeerStatus('reconnecting…', false);
-                try { rtc.peer.reconnect(); } catch(e) {}
-            });
-
-            // RECEIVER SIDE — incoming WebRTC call
-            rtc.peer.on('call', handleIncomingCall);
-        }
-
-        function handleIncomingCall(conn) {
-            rtc.incomingConn = conn;
-            // Extract caller metadata if available
-            const meta = conn.metadata || {};
-            const jobInfo = meta.jobId ? ('RE: ' + meta.jobId + ' @ ' + (meta.site || '')) : 'Incoming call';
-            document.getElementById('incomingJobInfo').textContent = jobInfo;
-            document.getElementById('callJobId').textContent = meta.jobId || 'Unknown';
-            document.getElementById('callJobSite').textContent = meta.site || '';
-            document.getElementById('incomingCallAlert').classList.remove('hidden');
-        }
-
-        // Resolve remote peer ID: look up the other party's Firebase UID
-        function getRemotePeerId(job) {
-            if (!job) return null;
-            const isMgr = state.role === 'management';
-
-            // If Firebase is live, look up the assigned tech's UID from the technicians roster
-            if (fb.ready) {
-                if (isMgr) {
-                    // Manager calling tech — find the tech's UID from job.techId or match by name
-                    const tech = state.technicians.find(t =>
-                        t.id === job.techId || t.id === job.tech ||
-                        t.name === job.tech || t.email === job.tech
-                    );
-                    if (tech) return '24S-' + tech.id;
-                } else {
-                    // Tech calling manager — find any management user
-                    const mgr = state.technicians.find(t => t.role === 'management');
-                    if (mgr) return '24S-' + mgr.id;
-                }
+            if (rtc.peer && !rtc.peer.destroyed && rtc.currentPeerId === myId) {
+                if (rtc.peer.disconnected) { try { rtc.peer.reconnect(); } catch (e) {} }
+                return;
             }
+            destroyPeer();
+            setPeerStatus('connecting…', false);
+            const p = new Peer(myId, {
+                debug: 1, ...RTC_CONFIG.server,
+                config: { iceServers: RTC_CONFIG.iceServers, iceCandidatePoolSize: 4 }
+            });
+            rtc.peer = p; rtc.currentPeerId = myId;
 
-            // Fallback: can't resolve
-            return null;
+            p.on('open', () => { rtc.retry = 0; setPeerStatus('online', true); });
+            p.on('call', handleIncomingCall);
+            p.on('disconnected', () => {
+                if (p.destroyed) return;
+                setPeerStatus('reconnecting…', false);
+                setTimeout(() => { try { if (p.disconnected && !p.destroyed) p.reconnect(); } catch (e) {} }, 1000);
+            });
+            p.on('error', e => {
+                if (e.type === 'peer-unavailable') return; // handled per call in dial()
+                console.error('PeerJS error:', e.type);
+                setPeerStatus(e.type, false);
+                if (['unavailable-id', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) scheduleRetry();
+            });
+        }
+
+        // Mobile browsers drop the signalling socket in the background — recover on resume / network return
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) initRTC(); });
+        window.addEventListener('online', () => initRTC());
+
+        function peerReady(ms = 8000) {
+            return new Promise(res => {
+                const p = rtc.peer;
+                if (!p) return res(false);
+                if (p.open) return res(true);
+                const t = setTimeout(() => res(false), ms);
+                p.once('open', () => { clearTimeout(t); res(true); });
+            });
+        }
+
+        // Candidate remote peers; the caller tries each until one is online
+        function getRemotePeerIds(job) {
+            if (!job || !fb.ready) return [];
+            const me = fb.auth.currentUser && fb.auth.currentUser.uid;
+            const list = state.role === 'management'
+                ? state.technicians.filter(t => t.id === job.techId || t.id === job.tech || t.name === job.tech || t.email === job.tech)
+                : state.technicians.filter(t => t.role === 'management');
+            return list.map(t => t.id).filter(id => id && id !== me).map(id => '24S-' + id);
         }
 
         async function getMedia(wantsVideo) {
-            try {
-                return await navigator.mediaDevices.getUserMedia({ audio: true, video: wantsVideo });
-            } catch (err) {
+            const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+            const video = wantsVideo ? { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 24, max: 30 }, facingMode: 'user' } : false;
+            try { return await navigator.mediaDevices.getUserMedia({ audio, video }); }
+            catch (err) {
                 console.warn('getUserMedia failed:', err);
+                if (wantsVideo) { try { return await navigator.mediaDevices.getUserMedia({ audio, video: false }); } catch (e) {} } // camera missing → audio-only
                 return null;
             }
         }
-
+        function releaseMedia() {
+            if (rtc.localStream) rtc.localStream.getTracks().forEach(t => t.stop());
+            rtc.localStream = null;
+        }
         function attachStreams() {
-            const lv = document.getElementById('localVideo');
-            if (rtc.localStream) lv.srcObject = rtc.localStream;
+            const hasVideo = rtc.localStream && rtc.localStream.getVideoTracks().length > 0;
+            $id('localVideo').srcObject = rtc.localStream;
+            $id('selfView').classList.toggle('hidden', !hasVideo);
+        }
+
+        function paintToggles() {
+            const m = $id('muteBtn'), v = $id('vidBtn');
+            m.classList.toggle('bg-[#ff3e3e]', rtc.muted);
+            m.querySelector('i').className = rtc.muted ? 'fas fa-microphone-slash text-white' : 'fas fa-microphone text-[#ff3e3e]';
+            v.classList.toggle('bg-[#ff3e3e]', rtc.videoOff);
+            v.querySelector('i').className = rtc.videoOff ? 'fas fa-video-slash text-white' : 'fas fa-video text-[#ff3e3e]';
+        }
+        function resetCallUI() {
+            Object.assign(rtc, { muted: false, videoOff: false, level: 0, bad: 0, good: 0, logged: false });
+            paintToggles();
+            $id('remotePlaceholder').classList.remove('hidden');
+            $id('remotePlaceholder').querySelector('span').textContent = 'Waiting for remote feed…';
+        }
+
+        // ---- Bandwidth control + adaptive quality ----
+        async function applyLevel(conn, idx) {
+            const pc = conn.peerConnection, lvl = RTC_CONFIG.levels[idx];
+            if (!pc) return;
+            rtc.level = idx;
+            for (const s of pc.getSenders()) {
+                if (!s.track) continue;
+                try {
+                    const prm = s.getParameters();
+                    if (!prm.encodings || !prm.encodings.length) prm.encodings = [{}];
+                    if (s.track.kind === 'video') {
+                        s.track.contentHint = 'motion';
+                        s.track.enabled = lvl.video && !rtc.videoOff;
+                        prm.encodings[0].maxBitrate = lvl.bitrate || 60000;
+                        prm.encodings[0].scaleResolutionDownBy = lvl.scale;
+                        prm.encodings[0].maxFramerate = 24;
+                        prm.degradationPreference = 'maintain-framerate';
+                    } else {
+                        s.track.contentHint = 'speech';
+                        prm.encodings[0].maxBitrate = RTC_CONFIG.audioBitrate;
+                    }
+                    await s.setParameters(prm);
+                } catch (e) {}
+            }
+        }
+
+        function stopMonitor() { clearInterval(rtc.statsTimer); rtc.statsTimer = null; }
+        function startMonitor(conn) {
+            stopMonitor();
+            let prev = null;
+            rtc.statsTimer = setInterval(async () => {
+                const pc = conn.peerConnection;
+                if (!pc || rtc.activeConn !== conn) return stopMonitor();
+                let lost = 0, recv = 0, rtt = 0;
+                try {
+                    (await pc.getStats()).forEach(r => {
+                        if (r.type === 'inbound-rtp') { lost += r.packetsLost || 0; recv += r.packetsReceived || 0; }
+                        if (r.type === 'candidate-pair' && r.nominated && r.currentRoundTripTime) rtt = r.currentRoundTripTime * 1000;
+                    });
+                } catch (e) { return; }
+                if (prev) {
+                    const dl = Math.max(0, lost - prev.lost), dr = Math.max(0, recv - prev.recv);
+                    const bad = dl / Math.max(1, dl + dr) > 0.08 || rtt > 600;
+                    rtc.bad = bad ? rtc.bad + 1 : 0;
+                    rtc.good = bad ? 0 : rtc.good + 1;
+                    const max = rtc.mode === 'video' ? RTC_CONFIG.levels.length - 1 : 0;
+                    if (rtc.bad >= 2 && rtc.level < max) { rtc.bad = 0; applyLevel(conn, rtc.level + 1); }
+                    else if (rtc.good >= 4 && rtc.level > 0) { rtc.good = 0; applyLevel(conn, rtc.level - 1); }
+                    if (rtc.mode === 'video') setCallStatus('Connected • ' + RTC_CONFIG.levels[rtc.level].label, true);
+                }
+                prev = { lost, recv };
+            }, 3000);
+        }
+
+        function keepAwake() { try { navigator.wakeLock && navigator.wakeLock.request('screen').then(l => rtc.wake = l).catch(() => {}); } catch (e) {} }
+        function releaseWake() { try { rtc.wake && rtc.wake.release(); } catch (e) {} rtc.wake = null; }
+
+        // Shared wiring for both caller and receiver
+        function bindCall(conn, type, jobId) {
+            rtc.activeConn = conn; rtc.mode = type;
+            conn.on('stream', remote => {
+                clearTimeout(rtc.ringTimer);
+                const rv = $id('remoteVideo');
+                if (rv.srcObject !== remote) rv.srcObject = remote;
+                rv.play().catch(() => {});
+                const hasVideo = remote.getVideoTracks().length > 0;
+                $id('remotePlaceholder').classList.toggle('hidden', hasVideo);
+                if (!hasVideo) $id('remotePlaceholder').querySelector('span').textContent = 'Voice call in progress';
+                setCallStatus('Connected', true);
+                if (!rtc.logged) { rtc.logged = true; logCall(type, jobId); }
+                applyLevel(conn, 0); startMonitor(conn); keepAwake();
+            });
+            conn.on('close', () => { if (rtc.activeConn === conn) endCall('Remote ended the call'); });
+            conn.on('error', err => { console.error('Call error:', err); if (rtc.activeConn === conn) endCall('Call error'); });
+
+            const pc = conn.peerConnection;
+            if (pc) {
+                let t;
+                pc.addEventListener('iceconnectionstatechange', () => {
+                    const s = pc.iceConnectionState; clearTimeout(t);
+                    if (rtc.activeConn !== conn) return;
+                    if (s === 'disconnected') {
+                        setCallStatus('Weak connection — retrying…', false);
+                        t = setTimeout(() => { if (rtc.activeConn === conn && !['connected', 'completed'].includes(pc.iceConnectionState)) endCall('Connection lost'); }, 10000);
+                    } else if (s === 'failed') endCall('Connection failed — check network');
+                    else if (s === 'connected' || s === 'completed') setCallStatus('Connected', true);
+                });
+            }
+        }
+
+        // Try each candidate remote user in turn; PeerJS reports 'peer-unavailable' instantly if they're offline
+        function dial(ids, i, type, job) {
+            const conn = rtc.peer.call(ids[i], rtc.localStream, {
+                metadata: { jobId: job.id, site: job.site, callerName: (state.user && state.user.name) || 'Unknown', type }
+            });
+            if (!conn) return endCall('Call failed — remote peer not found');
+            const onErr = e => {
+                if (e.type !== 'peer-unavailable' || rtc.activeConn !== conn) return;
+                rtc.peer.off('error', onErr);
+                rtc.activeConn = null; try { conn.close(); } catch (x) {}
+                if (i + 1 < ids.length) dial(ids, i + 1, type, job);
+                else endCall('Remote user is offline — ensure they are signed in');
+            };
+            rtc.peer.on('error', onErr);
+            conn.on('stream', () => rtc.peer && rtc.peer.off('error', onErr));
+            bindCall(conn, type, job.id);
+            setCallStatus('Ringing…', false);
+            clearTimeout(rtc.ringTimer);
+            rtc.ringTimer = setTimeout(() => { if (rtc.activeConn === conn && !rtc.logged) endCall('No answer'); }, RTC_CONFIG.ringTimeoutMs);
         }
 
         // CALLER SIDE
         async function startCall(type) {
+            if (rtc.activeConn || rtc.ending) return;
             const job = getActiveJob();
-            if (!job) {
-                alert('Select an active job before starting a call.');
-                return;
-            }
+            if (!job) { alert('Select an active job before starting a call.'); return; }
             state.activeJobId = job.id;
             rtc.mode = type;
 
-            document.getElementById('callJobId').textContent = job.id;
-            document.getElementById('callJobSite').textContent = job.site + ' • ' + (job.loc || '');
-            document.getElementById('connectJobId').textContent = job.id;
-            document.getElementById('connectJobSite').textContent = job.site + ' • ' + (job.loc || '');
+            const site = job.site + ' • ' + (job.loc || '');
+            $id('callJobId').textContent = job.id; $id('callJobSite').textContent = site;
+            $id('connectJobId').textContent = job.id; $id('connectJobSite').textContent = site;
 
-            initRTC();
-            const status = document.getElementById('callStatus');
-            status.style.color = '#ff8080';
-            openModal('callModal');
+            initRTC(); resetCallUI(); openModal('callModal');
+            setCallStatus('Preparing ' + (type === 'video' ? 'video' : 'voice') + ' call…', false);
 
-            // Wait for peer to be ready
-            if (!rtc.peer || !rtc.peer.open) {
-                status.textContent = 'Signaling handshake…';
-                await new Promise(resolve => {
-                    const check = setInterval(() => {
-                        if (rtc.peer && rtc.peer.open) { clearInterval(check); resolve(); }
-                    }, 200);
-                    setTimeout(() => { clearInterval(check); resolve(); }, 5000);
-                });
-            }
+            // Mic/camera prompt and signalling handshake run in parallel
+            const [ready, stream] = await Promise.all([peerReady(), getMedia(type === 'video')]);
+            if (!stream) return setCallStatus('Camera/mic blocked. Allow permissions (HTTPS required).', false);
+            rtc.localStream = stream; attachStreams();
+            if (!ready) { releaseMedia(); return setCallStatus('Signaling server unreachable. Check connection.', false); }
 
-            if (!rtc.peer || !rtc.peer.open) {
-                status.textContent = 'Signaling server unreachable. Check connection.';
-                return;
-            }
+            const ids = getRemotePeerIds(job);
+            if (!ids.length) { releaseMedia(); return setCallStatus('Cannot resolve remote user. Ensure both parties are signed in.', false); }
+            dial(ids, 0, type, job);
+        }
 
-            status.textContent = (type === 'video' ? 'Dialling L2 Video Assist…' : 'Dialling HQ Voice…');
-
-            rtc.localStream = await getMedia(type === 'video');
-            if (!rtc.localStream) {
-                status.textContent = 'Camera/mic blocked. Allow permissions (HTTPS required).';
-                return;
-            }
-            attachStreams();
-            if (type === 'video') document.getElementById('selfView').classList.remove('hidden');
-
-            const remoteId = getRemotePeerId(job);
-            if (!remoteId) {
-                status.textContent = 'Cannot resolve remote user. Ensure both parties are signed in.';
-                return;
-            }
-
-            console.log('Calling remote peer:', remoteId, 'from:', rtc.currentPeerId);
-            status.textContent = 'Ringing ' + remoteId.replace('24S-', '') + '…';
-
-            rtc.activeConn = rtc.peer.call(remoteId, rtc.localStream, {
-                metadata: { jobId: job.id, site: job.site, callerName: state.user?.name || 'Unknown' }
-            });
-
-            if (!rtc.activeConn) {
-                status.textContent = 'Call failed — remote peer not found.';
-                return;
-            }
-
-            rtc.activeConn.on('stream', remote => {
-                const rv = document.getElementById('remoteVideo');
-                const ra = document.getElementById('remoteAudio');
-                if (type === 'video') { rv.srcObject = remote; } else { ra.srcObject = remote; }
-                document.getElementById('remotePlaceholder').classList.add('hidden');
-                status.textContent = 'Connected';
-                status.style.color = '#00ff88';
-                logCall(type, job.id);
-            });
-            rtc.activeConn.on('close', endCall);
-            rtc.activeConn.on('error', (err) => {
-                console.error('Call error:', err);
-                status.textContent = 'Remote peer offline — ensure they are signed in.';
-            });
+        function handleIncomingCall(conn) {
+            if (rtc.activeConn || rtc.incomingConn) { try { conn.close(); } catch (e) {} return; } // busy
+            rtc.incomingConn = conn;
+            const meta = conn.metadata || {};
+            $id('incomingJobInfo').textContent = meta.jobId ? ('RE: ' + meta.jobId + ' @ ' + (meta.site || '')) : 'Incoming call';
+            $id('callJobId').textContent = meta.jobId || 'Unknown';
+            $id('callJobSite').textContent = meta.site || '';
+            $id('incomingCallAlert').classList.remove('hidden');
+            const buzz = () => { try { navigator.vibrate && navigator.vibrate([400, 200, 400]); } catch (e) {} };
+            buzz(); rtc.ringBuzz = setInterval(buzz, 2000);
+            rtc.ringAuto = setTimeout(() => answerCall(false), RTC_CONFIG.ringTimeoutMs);
+            conn.on('close', () => { if (rtc.incomingConn === conn) { rtc.incomingConn = null; stopRinging(); } }); // caller hung up
+        }
+        function stopRinging() {
+            clearInterval(rtc.ringBuzz); clearTimeout(rtc.ringAuto);
+            $id('incomingCallAlert').classList.add('hidden');
+            try { navigator.vibrate && navigator.vibrate(0); } catch (e) {}
         }
 
         // RECEIVER SIDE
         async function answerCall(accept) {
-            document.getElementById('incomingCallAlert').classList.add('hidden');
-            if (!accept) {
-                if (rtc.incomingConn) { try { rtc.incomingConn.close(); } catch(e) {} }
-                rtc.incomingConn = null;
-                return;
-            }
+            const conn = rtc.incomingConn;
+            rtc.incomingConn = null; stopRinging();
+            if (!conn) return;
+            if (!accept) { try { conn.close(); } catch (e) {} return; }
 
-            const job = getActiveJob();
-            const status = document.getElementById('callStatus');
-            status.textContent = 'Answering…';
-            openModal('callModal');
+            const meta = conn.metadata || {};
+            const type = meta.type === 'voice' ? 'voice' : 'video';
+            resetCallUI(); openModal('callModal'); setCallStatus('Answering…', false);
 
-            rtc.localStream = await getMedia(true);
-            if (!rtc.localStream) { status.textContent = 'Mic blocked. Allow permissions.'; return; }
-            attachStreams();
-            document.getElementById('selfView').classList.remove('hidden');
-
-            rtc.activeConn = rtc.incomingConn;
-            rtc.activeConn.answer(rtc.localStream);
-            rtc.activeConn.on('stream', remote => {
-                document.getElementById('remoteVideo').srcObject = remote;
-                document.getElementById('remotePlaceholder').classList.add('hidden');
-                status.textContent = 'Connected';
-                status.style.color = '#00ff88';
-                logCall('video', job?.id || 'unknown');
-            });
-            rtc.activeConn.on('close', endCall);
+            const stream = await getMedia(type === 'video'); // falls back to audio-only if no camera
+            if (!stream) { try { conn.close(); } catch (e) {} return setCallStatus('Mic blocked. Allow permissions.', false); }
+            rtc.localStream = stream; attachStreams();
+            try { conn.answer(stream); } catch (e) { return endCall('Caller already hung up'); }
+            bindCall(conn, type, meta.jobId || (getActiveJob() || {}).id || 'unknown');
         }
 
-        function endCall() {
-            if (rtc.activeConn) { try { rtc.activeConn.close(); } catch(e){} rtc.activeConn = null; }
-            if (rtc.localStream) { rtc.localStream.getTracks().forEach(t => t.stop()); rtc.localStream = null; }
-            document.getElementById('remoteVideo').srcObject = null;
-            document.getElementById('localVideo').srcObject = null;
-            document.getElementById('selfView').classList.add('hidden');
-            document.getElementById('remotePlaceholder').classList.remove('hidden');
-            const status = document.getElementById('callStatus');
-            status.textContent = 'Call ended';
-            status.style.color = '#ff8080';
-            setTimeout(() => closeModal('callModal'), 600);
+        function endCall(reason) {
+            if (rtc.ending) return;
+            rtc.ending = true;
+            clearTimeout(rtc.ringTimer); stopMonitor(); releaseWake();
+            const c = rtc.activeConn; rtc.activeConn = null;
+            if (c) { try { c.close(); } catch (e) {} }
+            releaseMedia();
+            $id('remoteVideo').srcObject = null; $id('localVideo').srcObject = null;
+            $id('selfView').classList.add('hidden');
+            $id('remotePlaceholder').classList.remove('hidden');
+            setCallStatus(typeof reason === 'string' ? reason : 'Call ended', false);
+            setTimeout(() => { closeModal('callModal'); rtc.ending = false; }, 700);
         }
 
         function toggleMute() {
             if (!rtc.localStream) return;
             rtc.muted = !rtc.muted;
             rtc.localStream.getAudioTracks().forEach(t => t.enabled = !rtc.muted);
-            const btn = document.getElementById('muteBtn');
-            btn.classList.toggle('bg-[#ff3e3e]', rtc.muted);
-            btn.querySelector('i').className = rtc.muted ? 'fas fa-microphone-slash text-white' : 'fas fa-microphone text-[#ff3e3e]';
+            paintToggles();
         }
 
         function toggleVideo() {
-            if (!rtc.localStream) return;
+            const tracks = rtc.localStream ? rtc.localStream.getVideoTracks() : [];
+            if (!tracks.length) return;
             rtc.videoOff = !rtc.videoOff;
-            rtc.localStream.getVideoTracks().forEach(t => t.enabled = !rtc.videoOff);
-            const btn = document.getElementById('vidBtn');
-            btn.classList.toggle('bg-[#ff3e3e]', rtc.videoOff);
-            btn.querySelector('i').className = rtc.videoOff ? 'fas fa-video-slash text-white' : 'fas fa-video text-[#ff3e3e]';
+            tracks.forEach(t => t.enabled = !rtc.videoOff && RTC_CONFIG.levels[rtc.level].video);
+            paintToggles();
         }
 
         function logCall(type, jobId) {
@@ -2397,7 +2473,7 @@
             closeModal('jobModal');
             state.activeJobId = job.id;
             initRTC();
-            alert('Level 2 Escalation raised for ' + job.id + '. L2 engineer (@' + peerIdFor('OPS', job.id) + ') notified with job context attached. Opening Connect…');
+            alert('Level 2 Escalation raised for ' + job.id + '. L2 engineer notified with job context attached. Opening Connect…');
             showTab('connect');
             startCall('video'); // straight into L2 video assist with job linked
         }
@@ -2525,6 +2601,7 @@
 
         function escalateFromAI() {
             const job = getActiveJob();
+            if (!job) { alert('No active job is available to escalate.'); return; }
             state.activeJobId = job.id;
             initRTC();
             logAIAction('Escalated ' + job.id + ' to Level 2');
