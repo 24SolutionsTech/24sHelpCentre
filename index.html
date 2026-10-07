@@ -400,17 +400,6 @@
             padding: 1rem;
         }
         .modal.open { display: flex; }
-
-        /* Incoming call banner: .glass-card (unlayered) forces position:relative and beats Tailwind v4's
-           layered 'fixed', which pushed the banner off-screen. Pin it explicitly so it always shows. */
-        #incomingCallAlert {
-            position: fixed !important;
-            top: max(1rem, env(safe-area-inset-top)) !important;
-            left: 50% !important;
-            transform: translateX(-50%) !important;
-            translate: none !important;
-            z-index: 9999 !important;
-        }
         .modal-card {
             background: var(--mid-blue);
             border: 2px solid var(--tech-red);
@@ -2438,6 +2427,62 @@
             dial(ids, 0, type, job);
         }
 
+        /* ---- Corporate ringtone (synthesised, no audio file needed) ---- */
+        const ringtone = { ctx: null, master: null, timer: null };
+
+        // Browsers only allow audio after a user gesture, so unlock on the first tap/click/key
+        function unlockAudio() {
+            try {
+                if (!ringtone.ctx) ringtone.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                if (ringtone.ctx.state === 'suspended') ringtone.ctx.resume();
+            } catch (e) {}
+        }
+        ['pointerdown', 'touchstart', 'keydown'].forEach(ev => document.addEventListener(ev, unlockAudio, { passive: true }));
+
+        // One soft bell-like note: sine fundamental + quiet overtones, fast attack, smooth decay
+        function playChime(freq, t0, dur, vol) {
+            const c = ringtone.ctx;
+            [[1, 1], [2, 0.22], [3, 0.07]].forEach(([mult, amp]) => {
+                const o = c.createOscillator(), g = c.createGain();
+                o.type = 'sine'; o.frequency.value = freq * mult;
+                g.gain.setValueAtTime(0.0001, t0);
+                g.gain.exponentialRampToValueAtTime(vol * amp, t0 + 0.015);
+                g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+                o.connect(g); g.connect(ringtone.master);
+                o.start(t0); o.stop(t0 + dur + 0.05);
+            });
+        }
+
+        // Rising E major arpeggio (E5-G#5-B5-E6), played twice, then a pause
+        function ringPhrase() {
+            const c = ringtone.ctx;
+            if (!c || c.state !== 'running') return;
+            const t = c.currentTime + 0.05;
+            [0, 1.1].forEach(offset =>
+                [[659.25, 0], [830.61, 0.17], [987.77, 0.34], [1318.51, 0.51]]
+                    .forEach(([f, d], i) => playChime(f, t + offset + d, i === 3 ? 0.9 : 0.55, 0.2)));
+        }
+
+        function startRingtone() {
+            stopRingtone();
+            unlockAudio();
+            const c = ringtone.ctx;
+            if (!c) return;
+            ringtone.master = c.createGain();
+            ringtone.master.gain.value = 0.8;
+            ringtone.master.connect(c.destination);
+            const go = () => { ringPhrase(); ringtone.timer = setInterval(ringPhrase, 3400); };
+            c.state === 'running' ? go() : c.resume().then(go).catch(() => {});
+        }
+
+        function stopRingtone() {
+            clearInterval(ringtone.timer); ringtone.timer = null;
+            if (ringtone.master && ringtone.ctx) {
+                try { ringtone.master.gain.setTargetAtTime(0, ringtone.ctx.currentTime, 0.03); } catch (e) {}
+            }
+            ringtone.master = null;
+        }
+
         function handleIncomingCall(conn) {
             if (rtc.activeConn || rtc.incomingConn) { try { conn.close(); } catch (e) {} return; } // busy
             rtc.incomingConn = conn;
@@ -2448,11 +2493,13 @@
             $id('incomingCallAlert').classList.remove('hidden');
             const buzz = () => { try { navigator.vibrate && navigator.vibrate([400, 200, 400]); } catch (e) {} };
             buzz(); rtc.ringBuzz = setInterval(buzz, 2000);
+            startRingtone();
             rtc.ringAuto = setTimeout(() => answerCall(false), RTC_CONFIG.ringTimeoutMs);
             conn.on('close', () => { if (rtc.incomingConn === conn) { rtc.incomingConn = null; stopRinging(); } }); // caller hung up
         }
         function stopRinging() {
             clearInterval(rtc.ringBuzz); clearTimeout(rtc.ringAuto);
+            stopRingtone();
             $id('incomingCallAlert').classList.add('hidden');
             try { navigator.vibrate && navigator.vibrate(0); } catch (e) {}
         }
