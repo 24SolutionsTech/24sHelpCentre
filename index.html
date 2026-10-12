@@ -1033,6 +1033,8 @@
                         <p id="connectJobSite" class="text-sm text-white/50">Select a job before starting a call.</p>
                     </div>
 
+                    <div id="callTargetWrap"></div>
+
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <button onclick="startCall('voice')" class="glass-card p-8 text-left hover:border-[#ff3e3e] transition-all group">
                             <i class="fas fa-phone-alt text-3xl text-[#ff3e3e] mb-4 group-hover:scale-110 transition-transform"></i>
@@ -1991,6 +1993,7 @@
                     state.technicians = snap.docs.map(d => ({ id: d.id, ...d.data() }));
                     populateTechnicianOptions();
                     renderUserRoster();
+                    try { refreshCallTargets(); } catch (e) {}
                 }, err => console.warn('users listener:', err)));
         }
 
@@ -2400,6 +2403,7 @@
 
                     <div class="bg-black/40 p-4 rounded-xl border-l-2 border-[#ff3e3e]/50">
                         <p class="text-[10px] font-black text-[#ff3e3e] uppercase mb-2">Need technical assistance?</p>
+                        ${callTargetSelectHTML()}
                         <div class="grid grid-cols-2 gap-3">
                             <button onclick="startCall('voice')" class="bg-[#ff3e3e] text-white py-4 rounded-xl font-black uppercase text-xs">📞 Call</button>
                             <button onclick="startCall('video')" class="bg-[#0a192f] border border-[#ff3e3e]/50 text-[#ff3e3e] py-4 rounded-xl font-black uppercase text-xs">🎥 Video Assist</button>
@@ -2649,6 +2653,34 @@
             });
         }
 
+        // ---- Technician chooses which management user to call ----
+        function getManagementUsers() {
+            const me = fb.ready && fb.auth.currentUser && fb.auth.currentUser.uid;
+            return state.technicians.filter(t => String(t.role || '').trim().toLowerCase() === 'management' && t.id !== me);
+        }
+        function callTargetSelectHTML() {
+            if (state.role === 'management') return '';
+            const opts = getManagementUsers().map(t => {
+                const label = String(t.name || t.displayName || t.email || t.id).replace(/</g, '&lt;');
+                return '<option value="' + t.id + '"' + (rtc.targetUid === t.id ? ' selected' : '') + '>' + label + '</option>';
+            }).join('');
+            return '<div class="mb-3"><label class="text-[10px] font-black uppercase text-white/40 block mb-1">Call who?</label>' +
+                '<select class="call-target w-full" onchange="setCallTarget(this.value)">' +
+                '<option value="">Any available management</option>' + opts + '</select></div>';
+        }
+        function setCallTarget(uid) {
+            rtc.targetUid = uid || null;
+            document.querySelectorAll('select.call-target').forEach(s => { s.value = uid || ''; });
+        }
+        function refreshCallTargets() {
+            const w = document.getElementById('callTargetWrap');
+            if (w) w.innerHTML = callTargetSelectHTML();
+            document.querySelectorAll('select.call-target').forEach(sel => {
+                if (sel.closest('#callTargetWrap')) return;
+                const box = sel.parentElement; if (box) box.outerHTML = callTargetSelectHTML();
+            });
+        }
+
         // Candidate remote peers; the caller tries each until one is online
         function getRemotePeerIds(job) {
             if (!job || !fb.ready) return [];
@@ -2661,7 +2693,8 @@
                 // Job has no matching technician → ring every technician; first one online picks up
                 if (!list.length) list = state.technicians.filter(t => t.role !== 'management');
             } else {
-                list = state.technicians.filter(t => t.role === 'management');
+                list = getManagementUsers();
+                if (rtc.targetUid) list = list.filter(t => t.id === rtc.targetUid);
             }
             const res = list.map(t => t.id).filter(id => id && id !== me).map(id => '24S-' + id);
             dlog('ROUTE', state.role + ' calling; job tech=' + (job.tech || '?') + ' techId=' + (job.techId || '?') + '; users loaded=' + state.technicians.length + '; candidates=' + res.length);
