@@ -1582,7 +1582,8 @@
             training: 'training',
             metrics: 'metrics',
             shifts: 'shifts',          // Module A: one document per shift
-            locations: 'locations'     // Module A: live position per employee
+            locations: 'locations',    // Module A: live position per employee
+            peers: 'peers'             // WebRTC: current peer id per user (call routing)
         };
 
         const fb = { ready: false, app: null, analytics: null, auth: null, db: null, storage: null, unsubscribers: [] };
@@ -2356,11 +2357,17 @@
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun.cloudflare.com:3478' },
                 // TURN relay: required on mobile data / CGNAT / corporate firewalls.
                 // This free public relay is for testing; replace with your own (Metered, Twilio, coturn) for production.
                 { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp'],
                   username: 'openrelayproject', credential: 'openrelayproject' }
             ],
+            // RECOMMENDED for reliability: paste your Metered (or similar) credentials URL, e.g.
+            // 'https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=YOUR_KEY'. It returns a fresh ICE server list.
+            turnApiUrl: '',
+            iceConnectTimeoutMs: 25000,   // give up on a single attempt if media path isn't up by then
+            maxAutoRetries: 1,            // silent re-dial attempts before showing a failure
             ringTimeoutMs: 45000,
             audioBitrate: 32000,
             // Adaptive video ladder: steps down on packet loss / high RTT, back up when the link recovers
@@ -2375,14 +2382,16 @@
             peer: null, localStream: null, activeConn: null, incomingConn: null,
             muted: false, videoOff: false, mode: 'voice', currentPeerId: null,
             retry: 0, retryTimer: null, ringTimer: null, ringBuzz: null, ringAuto: null,
-            statsTimer: null, level: 0, bad: 0, good: 0, logged: false, ending: false, wake: null
+            statsTimer: null, level: 0, bad: 0, good: 0, logged: false, ending: false, wake: null,
+            session: Math.random().toString(36).slice(2, 7), iceServers: null, iceReady: false,
+            peerStartedAt: 0, presenceTimer: null, lastDial: null, callRetries: 0, iceTimer: null, side: null
         };
         const $id = id => document.getElementById(id);
 
         // Firebase UID as peer ID so both sides always find each other
         function getMyPeerId() {
             const uid = fb.ready && fb.auth.currentUser ? fb.auth.currentUser.uid : null;
-            if (uid) return '24S-' + uid;
+            if (uid) return '24S-' + uid + '-' + rtc.session;   // unique per tab/device so two sessions never collide
             return '24S-LOCAL-' + String(state.role).toUpperCase() + '-' + Math.random().toString(36).slice(2, 8);
         }
 
@@ -2395,10 +2404,45 @@
             if (el) { el.textContent = txt; el.style.color = ok ? '#00ff88' : '#ff8080'; }
         }
 
+        // ---- Call routing: each user publishes their *current* peer id; callers look it up before dialling ----
+        function publishPresence() {
+            if (!(fb.ready && fb.auth.currentUser) || !rtc.currentPeerId) return;
+            fb.db.collection(FB_COLLECTIONS.peers).doc(fb.auth.currentUser.uid)
+                .set({ peerId: rtc.currentPeerId, name: (state.user && state.user.name) || '', at: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true })
+                .catch(() => {});
+        }
+        async function resolveRemotePeerIds(job) {
+            const uids = getRemotePeerIds(job).map(id => id.replace(/^24S-/, ''));
+            const out = [];
+            await Promise.all(uids.map(async (u) => {
+                let pid = null;
+                try {
+                    const snap = await Promise.race([
+                        fb.db.collection(FB_COLLECTIONS.peers).doc(u).get(),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))
+                    ]);
+                    if (snap.exists && snap.data().peerId) pid = snap.data().peerId;
+                } catch (e) {}
+                out.push(pid || ('24S-' + u));
+            }));
+            return out;
+        }
+        // Fresh TURN credentials (optional). Always resolves; falls back to the static list.
+        async function refreshIce() {
+            if (!RTC_CONFIG.turnApiUrl) { rtc.iceReady = true; return; }
+            try {
+                const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
+                const r = await fetch(RTC_CONFIG.turnApiUrl, { signal: ctl.signal }); clearTimeout(t);
+                const list = await r.json();
+                if (Array.isArray(list) && list.length) rtc.iceServers = list.concat(RTC_CONFIG.iceServers.filter(x => String(x.urls).includes('stun')));
+            } catch (e) { console.warn('TURN credential fetch failed, using defaults'); }
+            rtc.iceReady = true;
+        }
+
         function destroyPeer() {
             clearTimeout(rtc.retryTimer);
             if (rtc.peer) { try { rtc.peer.destroy(); } catch (e) {} }
-            rtc.peer = null; rtc.currentPeerId = null;
+            rtc.peer = null; rtc.currentPeerId = null; clearInterval(rtc.presenceTimer);
         }
 
         // Exponential backoff re-registration (1s, 2s, 4s … max 30s); never tears down a live call
@@ -2445,6 +2489,7 @@
                 loadPeerLib().then(ok => ok ? initRTC() : setPeerStatus('PeerJS blocked — check network', false));
                 return;
             }
+            if (!rtc.iceReady) { refreshIce().then(() => initRTC()); return; }
             const myId = getMyPeerId();
             if (rtc.peer && !rtc.peer.destroyed && rtc.currentPeerId === myId) {
                 if (rtc.peer.disconnected) { try { rtc.peer.reconnect(); } catch (e) {} }
@@ -2454,11 +2499,15 @@
             setPeerStatus('connecting…', false);
             const p = new Peer(myId, {
                 debug: 1, ...RTC_CONFIG.server,
-                config: { iceServers: RTC_CONFIG.iceServers, iceCandidatePoolSize: 4 }
+                config: { iceServers: rtc.iceServers || RTC_CONFIG.iceServers, iceCandidatePoolSize: 4 }
             });
-            rtc.peer = p; rtc.currentPeerId = myId;
+            rtc.peer = p; rtc.currentPeerId = myId; rtc.peerStartedAt = Date.now();
 
-            p.on('open', () => { rtc.retry = 0; setPeerStatus('online', true); });
+            p.on('open', () => {
+                rtc.retry = 0; setPeerStatus('online', true);
+                publishPresence();
+                clearInterval(rtc.presenceTimer); rtc.presenceTimer = setInterval(publishPresence, 60000);
+            });
             p.on('call', handleIncomingCall);
             p.on('disconnected', () => {
                 if (p.destroyed) return;
@@ -2467,6 +2516,7 @@
             });
             p.on('error', e => {
                 if (e.type === 'peer-unavailable') return; // handled per call in dial()
+                if (e.type === 'unavailable-id') rtc.session = Math.random().toString(36).slice(2, 7); // id still held by a dead socket: take a new one
                 console.error('PeerJS error:', e.type);
                 setPeerStatus(e.type, false);
                 if (['unavailable-id', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) scheduleRetry();
@@ -2476,6 +2526,14 @@
         // Mobile browsers drop the signalling socket in the background — recover on resume / network return
         document.addEventListener('visibilitychange', () => { if (!document.hidden) initRTC(); });
         window.addEventListener('online', () => initRTC());
+        // Watchdog: if signalling is silently dead or stuck connecting, rebuild it so incoming calls can always arrive
+        setInterval(() => {
+            if (!state.role || rtc.activeConn) return;
+            const p = rtc.peer;
+            if (!p || p.destroyed) return initRTC();
+            if (p.disconnected) { try { p.reconnect(); } catch (e) {} return; }
+            if (!p.open && Date.now() - rtc.peerStartedAt > 20000) { destroyPeer(); initRTC(); }
+        }, 15000);
 
         async function peerReady(ms = 8000) {
             if (!rtc.peer) {
@@ -2616,17 +2674,37 @@
                 pc.addEventListener('iceconnectionstatechange', () => {
                     const s = pc.iceConnectionState; clearTimeout(t);
                     if (rtc.activeConn !== conn) return;
-                    if (s === 'disconnected') {
+                    if (s === 'checking') {
+                        clearTimeout(rtc.iceTimer);
+                        rtc.iceTimer = setTimeout(() => {
+                            if (rtc.activeConn === conn && !['connected', 'completed'].includes(pc.iceConnectionState)) failCall(conn, 'Could not establish a connection — check network');
+                        }, RTC_CONFIG.iceConnectTimeoutMs);
+                    } else if (s === 'disconnected') {
                         setCallStatus('Weak connection — retrying…', false);
                         t = setTimeout(() => { if (rtc.activeConn === conn && !['connected', 'completed'].includes(pc.iceConnectionState)) endCall('Connection lost'); }, 10000);
-                    } else if (s === 'failed') endCall('Connection failed — check network');
-                    else if (s === 'connected' || s === 'completed') setCallStatus('Connected', true);
+                    } else if (s === 'failed') failCall(conn, 'Connection failed — check network');
+                    else if (s === 'connected' || s === 'completed') { clearTimeout(rtc.iceTimer); setCallStatus('Connected', true); }
                 });
             }
         }
 
+        // Caller-side silent retry when the media path cannot be established; otherwise end with the reason
+        function failCall(conn, reason) {
+            const d = rtc.lastDial;
+            if (rtc.side === 'caller' && !rtc.logged && d && rtc.callRetries < RTC_CONFIG.maxAutoRetries && rtc.localStream) {
+                rtc.callRetries++;
+                clearTimeout(rtc.iceTimer); clearTimeout(rtc.ringTimer);
+                rtc.activeConn = null; try { conn.close(); } catch (e) {}
+                setCallStatus('Reconnecting…', false);
+                setTimeout(() => { if (!rtc.ending && !rtc.activeConn && rtc.localStream) dial(d.ids, d.i, d.type, d.job); }, 1500);
+                return;
+            }
+            endCall(reason);
+        }
+
         // Try each candidate remote user in turn; PeerJS reports 'peer-unavailable' instantly if they're offline
         function dial(ids, i, type, job) {
+            rtc.side = 'caller'; rtc.lastDial = { ids, i, type, job };
             const conn = rtc.peer.call(ids[i], rtc.localStream, {
                 metadata: { jobId: job.id, site: job.site, callerName: (state.user && state.user.name) || 'Unknown', type }
             });
@@ -2652,7 +2730,7 @@
             const job = getActiveJob();
             if (!job) { alert('Select an active job before starting a call.'); return; }
             state.activeJobId = job.id;
-            rtc.mode = type;
+            rtc.mode = type; rtc.callRetries = 0;
 
             const site = job.site + ' • ' + (job.loc || '');
             $id('callJobId').textContent = job.id; $id('callJobSite').textContent = site;
@@ -2667,7 +2745,8 @@
             rtc.localStream = stream; attachStreams();
             if (!ready) { releaseMedia(); return setCallStatus('Signaling server unreachable. Check connection.', false); }
 
-            const ids = getRemotePeerIds(job);
+            setCallStatus('Locating remote user…', false);
+            const ids = await resolveRemotePeerIds(job);
             if (!ids.length) { releaseMedia(); return setCallStatus('Cannot resolve remote user. Ensure both parties are signed in.', false); }
             dial(ids, 0, type, job);
         }
@@ -2758,6 +2837,7 @@
 
             const meta = conn.metadata || {};
             const type = meta.type === 'voice' ? 'voice' : 'video';
+            rtc.side = 'receiver';
             resetCallUI(); openModal('callModal'); setCallStatus('Answering…', false);
 
             const stream = await getMedia(type === 'video'); // falls back to audio-only if no camera
@@ -2770,7 +2850,7 @@
         function endCall(reason) {
             if (rtc.ending) return;
             rtc.ending = true;
-            clearTimeout(rtc.ringTimer); stopMonitor(); releaseWake();
+            clearTimeout(rtc.ringTimer); clearTimeout(rtc.iceTimer); stopMonitor(); releaseWake();
             const c = rtc.activeConn; rtc.activeConn = null;
             if (c) { try { c.close(); } catch (e) {} }
             releaseMedia();
