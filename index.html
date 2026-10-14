@@ -1232,6 +1232,24 @@
         @media (max-width:420px){
             html{font-size:13px}
         }
+        /* ===== iPHONE FIT + STATIC HEADER (<1024px) ===== */
+        @media (max-width:1023px){
+            html,body{height:100%;overscroll-behavior:none;-webkit-overflow-scrolling:auto}
+            /* app locked to the visible viewport: only <main> scrolls, so the header never moves */
+            #app{position:fixed !important;inset:0;width:100% !important;height:100dvh !important;overflow:hidden}
+            #app > div.flex-1{min-height:0;height:100%;overflow:hidden}
+            .top-bar{flex-shrink:0;position:relative;z-index:200;height:auto;min-height:60px;
+                padding-top:env(safe-area-inset-top,0px);
+                padding-left:max(.75rem,env(safe-area-inset-left,0px));
+                padding-right:max(.75rem,env(safe-area-inset-right,0px))}
+            #mainScrollFix{min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior-y:contain;
+                padding-bottom:max(1rem,env(safe-area-inset-bottom,0px)) !important}
+            .tab-pane{min-height:0}
+            #sidebar{height:100dvh;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+            .modal-card{max-height:100dvh}
+            #loginScreen{height:100dvh;overflow-y:auto}
+        }
+
     </style>
 </head>
 <body class="min-h-screen">
