@@ -1250,7 +1250,19 @@
             #loginScreen{height:100dvh;overflow-y:auto}
         }
 
-    </style>
+    
+        /* ===== Deregister / Reinstate user buttons ===== */
+        .dereg-btn{flex-shrink:0;font-size:9px;font-weight:900;letter-spacing:.12em;text-transform:uppercase;padding:.4rem .75rem;border-radius:999px;cursor:pointer;
+            color:#dc2626 !important;background:rgba(220,38,38,.08) !important;border:1px solid rgba(220,38,38,.38) !important;transition:background .15s,color .15s}
+        .dereg-btn:hover{background:#dc2626 !important;color:#fff !important}
+        .dereg-btn.reinstate{color:#1d4ed8 !important;background:rgba(37,99,235,.08) !important;border-color:rgba(37,99,235,.38) !important}
+        .dereg-btn.reinstate:hover{background:#2563eb !important;color:#fff !important}
+        .dereg-btn.big{display:block;width:100%;padding:.9rem 1rem;font-size:11px;margin-top:1.25rem;border-radius:1rem}
+            /* iPhone 15 fit-ups */
+        #ai button[onclick="triggerAI()"]{color:#fff}
+        @media (max-width:1023px){.tab-pane{padding-bottom:88px}}
+        @media (max-width:480px){#ai .glass-card.px-4.py-2{padding-left:10px;padding-right:10px;max-width:100%}#ai .glass-card.px-4.py-2 span{font-size:8px;letter-spacing:.06em}}
+</style>
 </head>
 <body class="min-h-screen">
 
@@ -2450,6 +2462,7 @@
             jobs: [],
             history: [],
             technicians: [],
+            allUsers: [],
             perf: [],
             training: [],
             sites: {},
@@ -2474,7 +2487,9 @@
             state.user = payload.user || state.user;
             state.jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
             state.history = Array.isArray(payload.history) ? payload.history : [];
-            state.technicians = Array.isArray(payload.technicians) ? payload.technicians : [];
+            const _allU = Array.isArray(payload.technicians) ? payload.technicians : [];
+            state.allUsers = _allU;
+            state.technicians = _allU.filter(u => !u.deregistered);
             state.perf = Array.isArray(payload.performance) ? payload.performance : [];
             state.training = Array.isArray(payload.training) ? payload.training : [];
             state.sites = payload.sites && typeof payload.sites === 'object' ? payload.sites : {};
@@ -2509,16 +2524,43 @@
         function renderUserRoster() {
             const el = document.getElementById('userRoster');
             if (!el) return;
-            el.innerHTML = state.technicians.length ? state.technicians.map(u => {
+            const all = (state.allUsers && state.allUsers.length) ? state.allUsers : state.technicians;
+            const me = state.user && state.user.id;
+            const canManage = state.role === 'management';
+            el.innerHTML = all.length ? all.map(u => {
                 const isMgr = u.role === 'management';
-                return `<div class="flex items-center justify-between gap-2 bg-black/40 p-2 rounded border-l-2 ${isMgr ? 'border-[#ff3e3e]' : 'border-white/15'}">
+                const gone = !!u.deregistered;
+                const idArg = JSON.stringify(String(u.id)).replace(/"/g, '&quot;');
+                const btn = !canManage || u.id === me ? '' : (gone
+                    ? `<button type="button" class="dereg-btn reinstate" onclick="setUserActive(${idArg}, true)">Reinstate</button>`
+                    : `<button type="button" class="dereg-btn" onclick="setUserActive(${idArg}, false)">Deregister</button>`);
+                return `<div class="flex items-center justify-between gap-2 bg-black/40 p-2 rounded border-l-2 ${isMgr ? 'border-[#ff3e3e]' : 'border-white/15'} ${gone ? 'opacity-60' : ''}">
                     <div class="min-w-0">
                         <p class="text-[11px] font-black uppercase truncate">${u.name || u.displayName || 'Unnamed'}</p>
                         <p class="text-[8px] text-white/30 truncate">${u.email || u.id}</p>
                     </div>
-                    <span class="status-badge ${isMgr ? 'bg-[#ff3e3e] text-white' : 'bg-white/10 text-white/50'} shrink-0">${isMgr ? 'Mgmt' : 'Tech'}</span>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <span class="status-badge ${gone ? 'bg-white/10 text-white/50' : isMgr ? 'bg-[#ff3e3e] text-white' : 'bg-white/10 text-white/50'}">${gone ? 'Deregistered' : isMgr ? 'Mgmt' : 'Tech'}</span>
+                        ${btn}
+                    </div>
                 </div>`;
             }).join('') : '<p class="text-[10px] text-white/30 italic uppercase">No users stored yet</p>';
+        }
+
+        // Deregister = block sign-in to the 24S apps (profile flag). Reinstate reverses it.
+        async function setUserActive(uid, active) {
+            if (state.role !== 'management') return alert('Only management can change user access.');
+            if (state.user && state.user.id === uid) return alert('You cannot deregister your own account.');
+            const u = (state.allUsers || []).find(x => x.id === uid); if (!u) return;
+            const nm = u.name || u.displayName || u.email || 'this user';
+            if (!confirm(active ? 'Reinstate ' + nm + '?\nThey will be able to sign in again.'
+                                : 'Deregister ' + nm + '?\nThey will be signed out and blocked from signing in to the 24S apps.')) return;
+            try {
+                const FV = firebase.firestore.FieldValue;
+                await fb.db.collection(FB_COLLECTIONS.users).doc(uid).update(active
+                    ? { deregistered: FV.delete(), deregisteredAt: FV.delete(), deregisteredBy: FV.delete() }
+                    : { deregistered: true, deregisteredAt: FV.serverTimestamp(), deregisteredBy: (state.user && state.user.id) || null });
+            } catch (err) { alert('Could not update user: ' + (err.message || err.code || err)); }
         }
 
         function populateTechnicianOptions() {
@@ -2552,6 +2594,12 @@
                 const uid = cred.user.uid;
                 const snap = await fb.db.collection(FB_COLLECTIONS.users).doc(uid).get();
                 const profile = snap.exists ? snap.data() : { name: cred.user.email, role: 'technician' };
+                if (profile.deregistered) {
+                    await fb.auth.signOut();
+                    errEl.textContent = 'Account deregistered — contact management';
+                    errEl.classList.remove('hidden');
+                    return;
+                }
                 const role = profile.role === 'management' ? 'management' : 'technician';
 
                 await loadFirebaseData();
@@ -2707,7 +2755,16 @@
             // Users — new registrations appear in selects and roster immediately.
             fb.unsubscribers.push(fb.db.collection(FB_COLLECTIONS.users)
                 .onSnapshot(snap => {
-                    state.technicians = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    const _all = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    const _me = state.user && _all.find(u => u.id === state.user.id);
+                    if (_me && _me.deregistered) {
+                        try { fb.auth.signOut(); } catch (e) {}
+                        alert('Your account has been deregistered. Contact management.');
+                        location.reload();
+                        return;
+                    }
+                    state.allUsers = _all;
+                    state.technicians = _all.filter(u => !u.deregistered);
                     populateTechnicianOptions();
                     renderUserRoster();
                     try { refreshCallTargets(); } catch (e) {}
@@ -5093,6 +5150,7 @@ async function triggerAI() {
                 try {
                     const snap = await fb.db.collection(FB_COLLECTIONS.users).doc(user.uid).get();
                     const profile = snap.exists ? snap.data() : { name: user.email, role: 'technician' };
+                    if (profile.deregistered) { fb.auth.signOut().catch(() => {}); return; }
                     const role = profile.role === 'management' ? 'management' : 'technician';
                     await loadFirebaseData();
                     handleLogin(role, { id: user.uid, name: profile.name || user.email, role: profile.roleTitle || (role === 'management' ? 'Operations' : 'Technician') });
@@ -6066,7 +6124,7 @@ async function triggerAI() {
     const j = state.jobs.find(x => x.id === id); if (!j) return;
     if (s === 'Completed') { state.activeJobId = id; if (document.querySelector('#jobModal.open')) completeJob(); else openJob(id); return; }
     const entry = { s, t: new Date().toISOString(), by: me() };
-    j.status = s; (STATUSLOG[j.id] = STATUSLOG[j.id] || []).push(entry); SV('statuslog', STATUSLOG);
+    j.status = s; (STATUSLOG[j.id] = STATUSLOG[j.id] || []).push(entry); SV('statuslog', STATUSLOG); try { cloudSet('statusLog', String(j.id), { id: String(j.id), site: j.site || '', entries: STATUSLOG[j.id] }); } catch (e) {}
     const patch = { status: s }; try { patch.statusLog = firebase.firestore.FieldValue.arrayUnion(entry); } catch (e) {}
     fbUpdateJob(j, patch); renderTechJobs();
     const el = document.getElementById('q24Status'); if (el) el.innerHTML = statusHTML(j);
@@ -6098,7 +6156,7 @@ async function triggerAI() {
     const m = encodeURIComponent(document.getElementById('q24Msg').value); let ph = String(a.phone || '').replace(/[^\d+]/g, '');
     if (ph.startsWith('0')) ph = '27' + ph.slice(1); ph = ph.replace('+', '');
     const url = ch === 'wa' ? 'https://wa.me/' + ph + '?text=' + m : ch === 'sms' ? 'sms:' + ph + '?body=' + m : 'mailto:' + a.email + '?subject=' + encodeURIComponent('Job ' + j.id + ' update') + '&body=' + m;
-    (SENT[j.id] = SENT[j.id] || []).push({ tpl: document.getElementById('q24Tpl').selectedOptions[0].text, ch, t: new Date().toISOString() }); SV('siteupdates', SENT);
+    (SENT[j.id] = SENT[j.id] || []).push({ tpl: document.getElementById('q24Tpl').selectedOptions[0].text, ch, t: new Date().toISOString() }); SV('siteupdates', SENT); try { cloudSet('siteUpdates', String(j.id), { id: String(j.id), site: j.site || '', items: SENT[j.id] }); } catch (e) {}
     window.open(url, '_blank'); q24Refresh();
   };
 
@@ -6143,7 +6201,7 @@ async function triggerAI() {
     if (job) {
       const a = getAccess(job.site);
       if (a && a.safety && ack && !ack.checked && !confirm('Site safety requirements are not confirmed. Complete anyway?')) return;
-      const entry = { s: 'Completed', t: new Date().toISOString(), by: me() }; (STATUSLOG[job.id] = STATUSLOG[job.id] || []).push(entry); SV('statuslog', STATUSLOG);
+      const entry = { s: 'Completed', t: new Date().toISOString(), by: me() }; (STATUSLOG[job.id] = STATUSLOG[job.id] || []).push(entry); SV('statuslog', STATUSLOG); try { cloudSet('statusLog', String(j.id), { id: String(job.id), site: job.site || '', entries: STATUSLOG[job.id] }); } catch (e) {}
       job.safetyAck = !!(ack && ack.checked); job.voiceUsed = !!window.__q24Voice; job.statusLog = STATUSLOG[job.id]; window.__q24Voice = false;
       const p = { safetyAck: job.safetyAck, voiceUsed: job.voiceUsed }; try { p.statusLog = firebase.firestore.FieldValue.arrayUnion(entry); } catch (e) {}
       fbUpdateJob(job, p);
@@ -6332,14 +6390,22 @@ async function triggerAI() {
   #meetings *{--tw-ring-color:#2563eb}
   @media(max-width:800px){.qm-side{position:absolute;right:0;top:46px;bottom:74px;z-index:3}}
   `;
+  st.textContent += `
+  #meetings .qm-join .q24-btn{white-space:nowrap;flex:0 0 auto;min-width:76px;padding:0 20px}
+  #meetings #qmInv{grid-template-columns:1fr 1fr;gap:4px 12px}
+  #meetings #qmInv label{display:flex;align-items:center;gap:8px;min-height:36px;text-transform:none;letter-spacing:0;font-size:12px;font-weight:700}
+  #meetings #qmInv input{width:auto;flex:0 0 auto}
+  #meetings .q24-card .flex.flex-wrap .q24-btn{flex:1 1 auto}
+  #q24Meet{height:100vh;height:100dvh;padding-top:env(safe-area-inset-top)}
+  #q24Meet .qm-bar{padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+  @media(max-width:480px){#meetings #qmInv{grid-template-columns:1fr}#q24Meet .qm-b{min-width:0;flex:1 1 28%;padding:0 10px}}`;
   document.head.appendChild(st);
 
   /* ---------- nav + lobby pane ---------- */
   const nav = document.createElement('div'); nav.className = 'nav-item'; nav.setAttribute('data-tab', 'meetings'); nav.setAttribute('onclick', "showTab('meetings')");
   nav.innerHTML = '<div class="blinking-red-dot w-1.5 h-1.5 rounded-full bg-[#ff3e3e] mr-2"></div><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 8-6 4 6 4z"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg> <span>Meetings</span>';
-  const mgr = document.querySelector('.manager-only.space-y-1'); if (mgr) mgr.insertBefore(nav, mgr.children[1] || null);
-  const pane = document.createElement('div'); pane.id = 'meetings'; pane.className = 'tab-pane hidden space-y-6 relative z-10';
-  const mj = document.getElementById('my-jobs'); if (mj) mj.parentNode.insertBefore(pane, mj);
+  const pane = document.createElement('div'); pane.id = 'meetings'; pane.className = 'space-y-6 relative z-10 manager-only'; pane.style.marginTop = '2.5rem';
+  const mj = document.getElementById('connect'); if (mj) mj.appendChild(pane);
   const names = () => [...new Set((state.technicians || []).map(t => t && (t.name || t.displayName)).filter(Boolean))].sort();
   const fmt = iso => new Date(iso).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
   const link = c => location.origin + location.pathname + '?meet=' + c;
@@ -6513,15 +6579,15 @@ async function triggerAI() {
   window.qmLeave = function (silent) {
     if (!M) return; const m = M; M = null; clearInterval(m.timer);
     if (m.isHost && !silent) Object.values(m.conns).forEach(c => say(c, { t: 'end' }));
-    if (!silent) { PAST.unshift({ title: m.meta.title, host: m.meta.host || me(), at: new Date(m.start).toISOString(), mins: Math.max(1, Math.round((Date.now() - m.start) / 6e4)), people: [...m.people], notes: $('qmNoteTxt').value, chat: m.chat }); PAST = PAST.slice(0, 40); SV('mtgrec', PAST); }
+    if (!silent) { PAST.unshift({ title: m.meta.title, host: m.meta.host || me(), at: new Date(m.start).toISOString(), mins: Math.max(1, Math.round((Date.now() - m.start) / 6e4)), people: [...m.people], notes: $('qmNoteTxt').value, chat: m.chat }); PAST = PAST.slice(0, 40); SV('mtgrec', PAST); const r0 = PAST[0]; r0.id = rid(10); try { if (fb.ready && fb.db) fb.db.collection('meetingRecords').doc(r0.id).set(r0).catch(() => {}); } catch (e) {} }
     try { if (m.screen) m.screen.getTracks().forEach(t => t.stop()); m.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
     setTimeout(() => { try { m.peer.destroy(); } catch (e) {} }, 300);
     ov.classList.remove('on'); $('qmGrid').innerHTML = ''; $('qmNoteTxt').value = ''; $('qmSide').classList.remove('on');
-    if (pane.classList.contains('active')) lobby();
+    if (pane.offsetParent !== null) lobby();
   };
 
   /* ---------- wiring: tab, reminders, link join, cloud sync ---------- */
-  const _show = window.showTab; window.showTab = function (id) { _show(id); if (id === 'meetings') lobby(); };
+  const _show = window.showTab; window.showTab = function (id) { if (id === 'meetings') id = 'connect'; _show(id); if (id === 'connect') lobby(); };
   const reminded = {};
   setInterval(() => {
     if (state.role !== 'management') return; const now = Date.now();
@@ -6531,10 +6597,11 @@ async function triggerAI() {
   let synced = false;
   setInterval(() => {
     if (synced || !fb.ready || !fb.db) return; synced = true;
+    try { fb.db.collection('meetingRecords').orderBy('at', 'desc').limit(40).onSnapshot(s => { PAST = s.docs.map(d => d.data()); SV('mtgrec', PAST); if (pane.offsetParent !== null) lobby(); }, () => {}); } catch (e) {}
     try { fb.db.collection('meetings').onSnapshot(s => {
       const rows = s.docs.map(d => d.data()), known = new Set(MEET.map(m => m.code));
       rows.forEach(r => { if (!known.has(r.code) && state.role === 'management' && (r.invitees || []).includes(me())) { toast('You were invited: ' + r.title + ' (' + fmt(r.start) + ')'); if (window.q24Notify) window.q24Notify('Meeting invite', r.title + ' • ' + fmt(r.start)); } });
-      MEET = rows; SV('meetings', MEET); if (pane.classList.contains('active')) lobby();
+      MEET = rows; SV('meetings', MEET); if (pane.offsetParent !== null) lobby();
     }, () => {}); } catch (e) {}
   }, 2000);
   const want = new URLSearchParams(location.search).get('meet');
@@ -6653,5 +6720,110 @@ async function triggerAI() {
     })();
     </script>
 <script>document.addEventListener('keydown',function(e){if(e.key==='Enter'&&e.target&&(e.target.id==='authEmail'||e.target.id==='authPassword')){e.preventDefault();var b=document.getElementById('authSubmit');if(b&&!b.disabled)b.click();}});</script>
+<script id="call-recorder">
+/* Records calls placed from this app (caller side only, so each call is saved once) and saves the log + audio to the shared
+ * `calls` collection / `callRecordings` storage folder, which the Crawler's Calls tab reads. Wraps logCall/endCall; no other code changed. */
+(function () {
+  let R = null;
+  const DBH = () => (typeof fb !== 'undefined' && fb && fb.ready && fb.db) ? fb.db : (typeof db !== 'undefined' ? db : null);
+  const STG = () => { try { return (typeof fb !== 'undefined' && fb && fb.storage) || (window.firebase && firebase.storage && firebase.storage()); } catch (e) { return null; } };
+  const meName = () => (state.user && (state.user.name || state.user.email)) || 'Unknown';
+  const other = () => { const list = state.technicians || state.users || []; const t = list.find(x => x && x.id === rtc.targetUid); return t ? { name: t.name || t.displayName || t.email || t.id, role: t.role || '' } : { name: 'Unknown', role: '' }; };
+  const save = (id, d) => { try { const h = DBH(); if (h) return h.collection('calls').doc(id).set(d, { merge: true }); } catch (e) {} return Promise.resolve(); };
+  const _log = window.logCall, _end = window.endCall;
+  window.logCall = function (type, jobId) {
+    try { _log.apply(this, arguments); } catch (e) {}
+    try {
+      if (rtc.side !== 'caller' || R) return;
+      const o = other(), id = 'call_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      R = { id, type, jobId: jobId || '', start: Date.now(), caller: meName(), callee: o.name, calleeRole: o.role, chunks: [], mr: null };
+      const rs = document.getElementById('remoteVideo') && document.getElementById('remoteVideo').srcObject;
+      if (window.MediaRecorder && rs && rtc.localStream && rs.getAudioTracks().length) {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)(), dest = ctx.createMediaStreamDestination();
+        if (rtc.localStream.getAudioTracks().length) ctx.createMediaStreamSource(new MediaStream(rtc.localStream.getAudioTracks())).connect(dest);
+        ctx.createMediaStreamSource(new MediaStream(rs.getAudioTracks())).connect(dest);
+        const mt = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+        const mr = new MediaRecorder(dest.stream, mt ? { mimeType: mt, audioBitsPerSecond: 24000 } : { audioBitsPerSecond: 24000 });
+        mr.ondataavailable = e => { if (e.data && e.data.size) R.chunks.push(e.data); };
+        mr.start(5000); R.mr = mr; R.ctx = ctx; R.mime = mr.mimeType || mt || 'audio/webm';
+      }
+    } catch (e) { console.warn('call recorder', e); }
+  };
+  function finish(reason) {
+    const r = R; R = null; if (!r) return;
+    const dur = Math.max(1, Math.round((Date.now() - r.start) / 1000));
+    const doc = { source: 'help-centre', type: r.type, jobId: r.jobId, caller: r.caller, callerName: r.caller, agent: r.callee, agentName: r.callee, calleeRole: r.calleeRole,
+      callAt: new Date(r.start).toISOString(), duration: dur, endReason: typeof reason === 'string' ? reason : 'Call ended',
+      notes: (r.type === 'video' ? 'Video' : 'Voice') + ' call ' + r.caller + ' → ' + r.callee + (r.jobId ? ' • job ' + r.jobId : '') };
+    save(r.id, doc);
+    if (!r.mr) return;
+    r.mr.onstop = async () => {
+      try { r.ctx && r.ctx.close(); const blob = new Blob(r.chunks, { type: r.mime }); if (!blob.size) return;
+        const st = STG(); if (!st) return; const ext = /mp4/.test(r.mime) ? 'm4a' : 'webm', path = 'callRecordings/' + r.id + '.' + ext;
+        const ref = st.ref().child(path); await ref.put(blob); const url = await ref.getDownloadURL();
+        save(r.id, { recordingUrl: url, storagePath: path, recordingBytes: blob.size });
+      } catch (e) { console.warn('call recording upload failed', e); save(r.id, { recordingError: String(e && e.message || e) }); }
+    };
+    try { r.mr.state !== 'inactive' && r.mr.stop(); } catch (e) {}
+  }
+  window.endCall = function (reason) {
+    try { if (!rtc.ending) { if (R) finish(reason); else if (rtc.side === 'caller' && !rtc.logged && /no answer|declin|busy|unavail|reject/i.test(String(reason || ''))) { const o = other(); save('call_' + Date.now().toString(36), { source: 'help-centre', type: rtc.mode || 'voice', caller: meName(), callerName: meName(), agent: o.name, agentName: o.name, callAt: new Date().toISOString(), duration: 0, endReason: String(reason), notes: 'Missed call ' + meName() + ' → ' + o.name + ' (' + reason + ')' }); } } } catch (e) {}
+    return _end.apply(this, arguments);
+  };
+})();
+</script>
+<script id="card-activator">
+/* Makes every card actionable: hover/keyboard feedback; click drills through to the related tab, or opens a full-size focus view
+ * (with Print / Save PDF) when the card is already on its target tab. Applies to cards rendered later too. */
+(function () {
+  const DEF = {dashboard:'performance',performance:'history','my-jobs':'dashboard',fleet:'connect',history:'focus'}, OVR = [['live incidents','history'],['today.s dispatch','my-jobs'],['regional status','fleet'],['value chain','intel'],['training gaps','resources'],['escalations','connect'],['recent shifts','history'],['distance|gps accuracy|last fix|points sent','scroll:tracking health'],['active job context|call context','select'],['no assigned jobs','dashboard'],['sla performance|technician leaderboard|call log','focus'],['groq ai|neural engine','select']];
+  const SEL = '.glass-card,.cx-card,.cx-hero,.status-badge,.q24-card';
+  const css = document.createElement('style');
+  css.textContent = '.q24-act{cursor:pointer;transition:transform .15s ease,box-shadow .15s ease,filter .15s ease}.q24-act:hover{transform:translateY(-2px);box-shadow:0 10px 28px -12px rgba(0,0,0,.55);filter:brightness(1.06)}.q24-act:active{transform:scale(.985)}.q24-act:focus-visible{outline:2px solid #60a5fa;outline-offset:2px}' +
+    '#q24Focus{position:fixed;inset:0;z-index:10060;background:rgba(2,6,23,.8);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;padding:16px}#q24Focus.on{display:flex}' +
+    '#q24Focus .ff{background:#0b1220;color:#e5e7eb;border:1px solid rgba(255,255,255,.15);border-radius:18px;width:min(1100px,100%);max-height:92vh;display:flex;flex-direction:column;overflow:hidden}#q24Focus .fh{display:flex;justify-content:space-between;gap:8px;align-items:center;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.12);font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.1em}' +
+    '#q24Focus .fb{padding:16px;overflow:auto}#q24Focus .fh button{border:1px solid rgba(255,255,255,.3);border-radius:999px;padding:6px 14px;font-size:10px;font-weight:900;text-transform:uppercase;color:#fff}';
+  document.head.appendChild(css);
+  const ov = document.createElement('div'); ov.id = 'q24Focus'; ov.innerHTML = '<div class="ff"><div class="fh"><span id="q24FT"></span><span><button id="q24FP">Print / PDF</button> <button id="q24FX">Close</button></span></div><div class="fb" id="q24FB"></div></div>';
+  document.body.appendChild(ov);
+  const close = () => ov.classList.remove('on');
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  document.getElementById('q24FX').onclick = close;
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  document.getElementById('q24FP').onclick = () => { const w = window.open('', '_blank'); if (!w) return; w.document.write('<title>' + document.getElementById('q24FT').textContent + '</title><body style="font:13px Arial;padding:20px">' + document.getElementById('q24FB').innerHTML.replace(/<canvas[^>]*>/g, '')); w.document.close(); w.print(); };
+  const curTab = () => { const t = document.querySelector('.tab-pane.active'); return t ? t.id : ''; };
+  const title = c => { const h = c.querySelector('h1,h2,h3,h4,.cx-job,[class*="tracking-widest"]'); return ((h || c).innerText || '').replace(/\s+/g, ' ').trim().slice(0, 70) || 'Details'; };
+  function focusView(c) {
+    const cl = c.cloneNode(true); cl.classList.remove('q24-act'); cl.removeAttribute('tabindex'); cl.removeAttribute('role'); cl.style.transform = 'none';
+    const src = c.querySelectorAll('canvas'), dst = cl.querySelectorAll('canvas');
+    src.forEach((s, i) => { try { const d = dst[i]; d.width = s.width; d.height = s.height; d.getContext('2d').drawImage(s, 0, 0); d.style.width = '100%'; d.style.height = 'auto'; } catch (e) {} });
+    cl.querySelectorAll('[class*="max-h"],[class*="overflow"]').forEach(x => { x.style.maxHeight = 'none'; });
+    document.getElementById('q24FT').textContent = title(c); const b = document.getElementById('q24FB'); b.innerHTML = ''; b.appendChild(cl); ov.classList.add('on');
+  }
+  function toPane(name) { const p = document.querySelector('.tab-pane.active'); return p; }
+  function run(c) {
+    const here = curTab(), txt = (c.innerText || '').toLowerCase().replace(/\s+/g, ' ').slice(0, 120);
+    let tgt = null; for (const [re, t] of OVR) { if (new RegExp(re, 'i').test(txt)) { tgt = t; break; } }
+    if (tgt === null) tgt = DEF[here] || 'focus';
+    if (c.classList.contains('status-badge') && tgt === 'focus') { const p = c.closest(SEL.replace('.status-badge,', '')); if (p) return focusView(p); }
+    if (tgt.indexOf('scroll:') === 0) { const k = tgt.slice(7).toLowerCase(), t = [...document.querySelectorAll('.tab-pane.active ' + SEL)].find(x => (x.innerText || '').toLowerCase().includes(k)); if (t) { t.scrollIntoView({ behavior: 'smooth', block: 'center' }); t.animate([{ boxShadow: '0 0 0 3px #60a5fa' }, { boxShadow: '0 0 0 0 transparent' }], { duration: 1400 }); return; } return focusView(c); }
+    if (tgt === 'select') { const s = document.querySelector('.tab-pane.active select, .tab-pane.active input:not([type=hidden])'); if (s) { s.scrollIntoView({ behavior: 'smooth', block: 'center' }); s.focus(); return; } return focusView(c); }
+    if (tgt === 'focus' || tgt === here || typeof window.showTab !== 'function') return focusView(c);
+    window.showTab(tgt); try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (e) {}
+  }
+  function skip(c) {
+    return c.classList.contains('lg-status') || c.closest('.modal-card,#q24Meet,#q24Focus,#login,[id*="login"],.lg-card,[onclick],#sidebar,#meetings') ||
+      c.getAttribute('onclick') || c.querySelector('button,a,input,select,textarea,[onclick]');
+  }
+  function scan() { document.querySelectorAll(SEL).forEach(c => { if (c.dataset.q24a) return; c.dataset.q24a = skip(c) ? '0' : '1'; if (c.dataset.q24a === '1') { c.classList.add('q24-act'); c.tabIndex = 0; c.setAttribute('role', 'button'); } }); }
+  document.addEventListener('click', e => {
+    const c = e.target.closest && e.target.closest('.q24-act'); if (!c || e.target.closest('button,a,input,select,textarea,label,[onclick]')) return;
+    const b = e.target.closest('.status-badge.q24-act'); run(b || c);
+  });
+  document.addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === ' ') && e.target.classList && e.target.classList.contains('q24-act')) { e.preventDefault(); run(e.target); } });
+  let t = null; new MutationObserver(() => { clearTimeout(t); t = setTimeout(scan, 250); }).observe(document.body, { childList: true, subtree: true });
+  scan(); setInterval(scan, 3000);
+})();
+</script>
 </body>
 </html>
